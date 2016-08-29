@@ -1,0 +1,251 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Config::IniFiles;
+use Data::Dumper;
+use Date::Simple qw/ date today /;
+use DBI;
+use File::Basename;
+use Getopt::Long;
+use HTML::Form;
+use HTTP::Cookies;
+use JSON;
+use WWW::Mechanize;
+
+sub usage {
+    print "$0 [--fromdate XXXX-XX-XX] [--todate XXXX-XX-XX] [--full] [--weekday monday|sunday|weekend|etc] [--dumper] [--push]\n";
+    exit 1;
+}
+
+$| = 1;
+
+my $bin_dir = dirname($0);
+my $conf_dir = "$bin_dir/../conf";
+my $db_dir = "$bin_dir/../db";
+
+my $inipath = "$conf_dir/elevcentralen.ini";
+my $ini = Config::IniFiles->new(-file=>$inipath)
+  or die "No inifile: $!\n";
+
+my ($arg_weekday, $arg_full, $arg_fromdate, $arg_todate, $arg_dumper, $arg_push);
+
+Getopt::Long::GetOptions (
+    "weekday=s" => \$arg_weekday,
+    "full!" => \$arg_full,
+    "fromdate=s" => \$arg_fromdate,
+    "todate=s" => \$arg_todate,
+    "dumper!" => \$arg_dumper,
+    "push!" => \$arg_push
+);
+
+if (! $arg_fromdate or ! $arg_todate) {
+    $arg_fromdate = today();
+    $arg_todate = $arg_fromdate + 120;
+}
+
+if (! $arg_full and ! $arg_weekday and ! $arg_dumper) {
+    usage;
+}
+
+binmode STDOUT, ':encoding(utf-8)';
+
+my $database = "$db_dir/elevcentralen-sqlite.db";
+
+my $db = DBI->connect("dbi:SQLite:$database", "", "")
+    or die "Couldn’t connect to db ".DBI->errstr;
+$db->do("CREATE TABLE IF NOT EXISTS lessons (
+    id INTEGER PRIMARY KEY,
+    weekday TEXT,
+    datetime DATETIME,
+    teacher TEXT
+    )"
+);
+
+my $insert_lesson_sql = "INSERT INTO lessons (
+                     weekday, datetime, teacher)
+                     VALUES ( ?, ?, ?)";
+my $insert_lesson_sth = $db->prepare( $insert_lesson_sql );
+
+my $select_lesson_sql = "SELECT * FROM lessons WHERE datetime = ? AND teacher = ?";
+my $select_lesson_sth = $db->prepare($select_lesson_sql);
+
+my $select_all_lessons_sql = "SELECT * FROM lessons";
+my $select_all_lessons_sth = $db->prepare($select_all_lessons_sql);
+
+my $delete_lesson_sql = "DELETE FROM lessons WHERE datetime = ? AND teacher = ?";
+my $delete_lesson_sth = $db->prepare($delete_lesson_sql);
+
+my $login_url = "https://www.elevcentralen.se/Login/Index";
+my $username = $ini->val('elevcentralen','username');
+my $password = $ini->val('elevcentralen','password');
+my $prowl_api_key = $ini->val('elevcentralen','api_key');
+my $prowl_post_url = "http://api.prowlapp.com/publicapi/add";
+
+my $hash_ref;
+
+print "Doing a search between the dates $arg_fromdate and $arg_todate.\n";
+
+my $mech = WWW::Mechanize->new();
+
+$mech->agent_alias( 'Windows IE 6' );
+$mech->cookie_jar(HTTP::Cookies->new());
+$mech->get($login_url);
+
+$mech->submit_form(
+        form_number => 1,
+        fields      => { Username => $username, Password => $password },
+    );
+    die unless ($mech->success);
+$mech->submit();
+
+if ($mech->status() != "200") {
+    print "Something wen't wrong when logging in to Elevcentralen. Exiting.\n";
+    exit 1;
+}
+
+my $booking_url = "https://www.elevcentralen.se/Booking";
+$mech->get($booking_url);
+if ($mech->status() != "200") {
+    print "Something wen't wrong when getting $booking_url. Exiting.\n";
+    exit 1;
+}
+
+$mech->content =~ /booking.person.id  = ([0-9]+);/;
+my $person_id = $1;
+if (! $person_id) {
+    print "Couldn't find person ID for $username\n";
+    exit 1;
+}
+
+my $form = $mech->form_number(2);
+
+
+my $menu = $form->find_input("SelectedEmployeeId");
+foreach my $employee_id ($menu->possible_values()) {
+    next if $employee_id eq "";
+    
+    my $j = encode_json {
+        "Source" => "StudentCentral",
+        "Person" => {"id" => $person_id},
+        "EducationTypeId" => 3,
+        "Start" => "${arg_fromdate}T00:00:00.000Z",
+        "End" => "${arg_todate}T23:59:59.000Z",
+        "SelectedView" => "Free",
+        "showInListView" => 'false',
+        "TeacherIDs" => [$employee_id],};
+    $mech->post("https://www.elevcentralen.se/Booking/Home/Data",
+        'Content-Type' => 'application/json', Content => $j);
+
+    if ($mech->status() != "200") {
+        print "Something wen't wrong when posting. Exiting.\n";
+        exit 1;
+    }
+ 
+    my $json_response_hash = decode_json $mech->content();
+    
+    my $available_timeslots = $json_response_hash->{availableTimeslots};
+    my $number_of_loops = $available_timeslots;
+    $number_of_loops--;
+    foreach my $timeslot (0 .. $number_of_loops) {
+        my $teacher_name = $json_response_hash->{items}->[$timeslot]->{employees}->[0]->{name};
+        my $lesson_start_full_date = $json_response_hash->{items}->[$timeslot]->{start};
+        my ($lesson_start_date, $lesson_start_time) = $lesson_start_full_date =~ /(.*)T(.*)/;
+        my $lesson_end_full_date = $json_response_hash->{items}->[$timeslot]->{end};
+        my ($lesson_end_date, $lesson_end_time) = $lesson_start_full_date =~ /(.*)T(.*)/;
+        $hash_ref->{date}->{$lesson_start_date}->{$lesson_start_time}->{$teacher_name} = 1;
+        my $day_of_week = date($lesson_start_date);
+        $day_of_week = lc($day_of_week->strftime("%A"));
+        $hash_ref->{day_of_week}->{$day_of_week}->{$lesson_start_date}->{$lesson_start_time}->{$teacher_name} = 1;
+    }
+}
+
+if ($arg_full) {
+    foreach my $date (sort keys %{$hash_ref->{date}}) {
+        print "$date\n";
+        foreach my $time (sort keys %{$hash_ref->{date}->{$date}}) { 
+            print "  $time\n";
+            foreach my $teacher (sort keys %{$hash_ref->{date}->{$date}->{$time}}) {
+                print "    $teacher\n";
+            }
+        }
+    }
+}
+
+if ($arg_weekday) {
+    my $message_to_prowl;
+    my $send_to_prowl = undef;
+    my @weekdays;
+    if ($arg_weekday eq "weekend") {
+        @weekdays = ("saturday", "sunday");
+    } else {
+        push(@weekdays, $arg_weekday);
+    }
+    foreach my $weekday (@weekdays) {
+        print "Available lessons on $weekday:\n";
+        if (! $message_to_prowl) {
+            $message_to_prowl = "Available lessons on $weekday:\n";
+        } else {
+            $message_to_prowl = "${message_to_prowl}Available lessons on $weekday:\n";
+        }
+        if (! $hash_ref->{day_of_week}->{$weekday}) {
+            $message_to_prowl = "${message_to_prowl}No available lessons on $weekday\n\n";
+            print "No available lessons on $weekday\n\n";
+        }
+        foreach my $date (sort keys %{$hash_ref->{day_of_week}->{$weekday}}) {
+            $message_to_prowl = "$message_to_prowl\n$date\n";
+            print "\n$date\n";
+            foreach my $time (sort keys %{$hash_ref->{day_of_week}->{$weekday}->{$date}}) {
+                $message_to_prowl = "$message_to_prowl  $time\n";
+                print "  $time\n";
+                foreach my $teacher (sort keys %{$hash_ref->{day_of_week}->{$weekday}->{$date}->{$time}}) {
+                    $message_to_prowl = "$message_to_prowl    $teacher\n";
+                    print "    $teacher\n";
+                    my $datetime = "${date}${time}.000Z";
+                    $select_lesson_sth->execute( $datetime, $teacher );
+                    if (! $select_lesson_sth->fetchrow_hashref) {
+                        print "Adding new lesson at $weekday the $date $time with $teacher in db.\n";
+                        $insert_lesson_sth->execute($weekday, $datetime, $teacher);
+                        $send_to_prowl = 1;
+                    }
+                }
+            }
+        }
+    }
+    if ($arg_push) {
+        if ($send_to_prowl) {
+            print "Pushing message to $prowl_post_url\n";
+            $mech->post(
+                $prowl_post_url,
+                [ apikey => $prowl_api_key,
+                  application => "Elevcentralen",
+                  description => "$message_to_prowl" ]
+            );
+        }
+    }
+}
+
+if ($arg_dumper) {
+    print Dumper $hash_ref;
+}
+
+# Remove lessons from database that is no longer online
+
+$select_all_lessons_sth->execute();
+while (my $row = $select_all_lessons_sth->fetchrow_hashref) {
+    my $weekday = $row->{weekday};
+    my $datetime = $row->{datetime};
+    my $teacher = $row->{teacher};
+    my $date;
+    my $time;
+    if ($datetime =~ /([0-9]{4}-[0-9]{2}-[0-9]{2})([0-9]{2}:[0-9]{2}:[0-9]{2})/) {
+        $date = $1;
+        $time = $2;
+    }
+    if (! $hash_ref->{day_of_week}->{$weekday}->{$date}->{$time}->{$teacher}) {
+        print "Removing lesson at $weekday the $date $time with $teacher in db, because it has been removed from the site.\n",
+        $delete_lesson_sth->execute($datetime, $teacher);
+    }
+}
+

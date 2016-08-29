@@ -1,0 +1,7 @@
+#!/bin/bash
+
+exec > >(logger -s -t "elevcentralen") 2>&1
+
+bin_path=$(dirname $0)
+
+${bin_path}/elevcentralen --weekday weekend --push
